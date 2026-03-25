@@ -1,0 +1,192 @@
+#!/bin/bash
+
+# --- KONFIGURASI ---
+BASE_WORKDIR="/dev/shm"
+PREFIX="exo-"
+LOG_FILE="/tmp/exoram.log"
+
+# --- HELPER FUNCTIONS ---
+log_info() { echo -e "\e[32m[INFO]\e[0m $1"; }
+log_warn() { echo -e "\e[33m[WARN]\e[0m $1"; }
+log_err()  { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
+
+# Mendapatkan info workdir dari PID
+get_workdir_by_pid() {
+    local pid=$1
+    ps -p "$pid" -o args= 2>/dev/null | grep -o "$BASE_WORKDIR/${PREFIX}[^/ ]*" | head -1
+}
+
+# --- CORE COMMANDS ---
+
+cmd_status() {
+    echo -e "PID\tSIZE\tPATH\t\t\tSTATUS"
+    echo -e "---\t----\t----\t\t\t\t\t-------"
+    
+    # Mencari semua direktori exo- di /dev/shm
+    for workdir in /dev/shm/exo-*; do
+        [ -d "$workdir" ] || continue
+        
+        # Cek apakah ada proses yang sedang mengakses direktori ini
+        # Menggunakan fuser atau lsof untuk deteksi akurat
+        local pids=$(fuser "$workdir" 2>/dev/null | awk '{print $NF}')
+        
+        local size=$(du -sh "$workdir" 2>/dev/null | cut -f1)
+        
+        if [ -n "$pids" ]; then
+            for pid in $pids; do
+                local comm=$(ps -p "$pid" -o comm=)
+                echo -e "$pid\t$size\t$workdir\t[RUNNING: $comm]"
+            done
+        else
+            echo -e "-\t$size\t$workdir\t[GHOST/CLOSED]"
+        fi
+    done
+}
+
+cmd_setup() {
+    local path_source="$1"
+    local basename=$(basename "$path_source" .exe)
+    local workdir="$BASE_WORKDIR/${PREFIX}$basename"
+
+    mkdir -p "$workdir"/{home,tmp,wineprefix}
+    log_info "Setup virtual env di: $workdir"
+}
+
+cmd_copy() {
+    local path_source="$1"
+    local basename=$(basename "$path_source" .exe)
+    local origin_dir=$(cd "$(dirname "$path_source")" && pwd)
+    local workdir="$BASE_WORKDIR/${PREFIX}$basename"
+
+    mkdir -p "$workdir"
+    log_info "Copying files dari $origin_dir..."
+    rsync -aq "$origin_dir/" "$workdir/" --exclude="*.log"
+}
+
+cmd_sync() {
+    local pid="$1"
+    local dest="$2"
+    local workdir=$(get_workdir_by_pid "$pid")
+
+    [[ -z "$workdir" ]] && log_err "PID $pid tidak valid di ExoRAM."
+    [[ -z "$dest" ]] && log_err "Path tujuan (flashdisk) diperlukan."
+
+    log_info "Syncing changes back to $dest..."
+    rsync -au "$workdir/" "$dest/"
+}
+
+cmd_kill() {
+    local pid="$1"
+    local workdir=$(get_workdir_by_pid "$pid")
+
+    if [[ -n "$pid" ]]; then
+        log_info "Killing process $pid..."
+        kill "$pid" 2>/dev/null && sleep 1
+        
+        # Kill wineserver jika folder mengandung wineprefix
+        if [[ -d "$workdir/wineprefix" ]]; then
+            WINEPREFIX="$workdir/wineprefix" wineserver -k 2>/dev/null
+        fi
+
+        if [[ -d "$workdir" ]]; then
+            log_info "Removing workdir: $workdir"
+            rm -rf "$workdir"
+        fi
+    else
+        log_err "PID tidak ditemukan."
+    fi
+}
+
+cmd_run() {
+    local opt_no_rm=false
+    local opt_no_sync=false
+    local opt_no_env=false
+    local opt_from_existing=false
+
+    # Parsing options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-rm)
+                opt_no_rm=true
+                shift # Buang argumen --no-rm, lanjut ke berikutnya
+                ;;
+            --no-sync)
+                opt_no_sync=true
+                shift
+                ;;
+            --no-env)
+                opt_no_env=true
+                shift
+                ;;
+            --from-existing)
+                opt_from_existing=true
+                shift
+                ;;
+            *)
+                echo "Opsi tidak dikenal: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    local app_path="$1"
+    local name=$(basename "$app_path")
+    local basename=$(basename "$app_path" .exe)
+    local workdir="$BASE_WORKDIR/${PREFIX}$basename"
+    local origin_dir=$(cd "$(dirname "$app_path")" && pwd)
+    
+    # -n
+    if ! $opt_no_rm; then
+        trap 'cmd_sync "$new_pid" "$origin_dir" && cmd_kill "$new_pid"' EXIT SIGINT SIGTERM
+        log_info "Auto-sync & cleanup diaktifkan saat app ditutup."
+    else
+        log_info "Mode Persisten: Tidak menghapus workdir ketika app ditutup."
+    fi
+
+    # -f
+    if ! $opt_from_existing; then
+        cmd_copy "$app_path"
+        $opt_no_env || cmd_setup "$app_path"
+    else
+        log_info "Menggunakan workdir yang sudah ada: $workdir"
+    fi
+
+    # Set Environment
+    if ! $opt_no_env; then
+        export HOME="$workdir/home"
+        export TMPDIR="$workdir/tmp"
+        export WINEPREFIX="$workdir/wineprefix"
+    fi
+
+    # Execute
+    cd "$workdir" || exit
+    log_info "Launching $name..."
+    if [[ "$name" == *.exe ]]; then
+        wine "$name" > /dev/null 2>&1 &
+    else
+        chmod +x "$name"
+        ./"$name" > /dev/null 2>&1 &
+    fi
+    
+    local new_pid=$!
+    log_info "App started with PID: $new_pid"
+
+    # Handle Automatic Cleanup/Sync (jika bukan background/manual)
+    # Jika user tidak pakai -n, kita bisa pantau PID ini (opsional)
+}
+
+# --- MAIN ---
+case "$1" in
+    run)     shift; cmd_run "$@" ;;
+    copy)    shift; cmd_copy "$1" ;;
+    setup)   shift; cmd_setup "$1" ;;
+    sync)    shift; cmd_sync "$2" "$3" ;; # exoram sync <pid> <path>
+    kill)    shift; cmd_kill "$2" ;;
+    status)  cmd_status ;;
+    cleanup) rm -rf /dev/shm/exo-* && log_info "All ExoRAM workdirs cleared." ;;
+    *)
+        echo "ExoRAM - Execute on RAM Utility"
+        echo "Usage: exoram <command> [option] <path/pid>"
+        echo "Commands: run, copy, setup, sync, kill, cleanup, status"
+        ;;
+esac
